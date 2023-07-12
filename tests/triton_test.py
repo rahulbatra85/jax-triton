@@ -98,7 +98,6 @@ class TritonTest(absltest.TestCase):
     np.testing.assert_allclose(add(x, y), x + y)
 
   def test_tanh_kernel(self):
-
     def tanh(x: jnp.ndarray) -> jnp.ndarray:
       out_shape = jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
       grid = lambda meta: (triton.cdiv(x.size, meta['BLOCK_SIZE']),)

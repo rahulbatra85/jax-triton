@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <variant>
 #include <vector>
+#include <iostream>
 
 #include "absl/base/call_once.h"
 #include "absl/base/optimization.h"
@@ -32,7 +33,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
-#include "cuda.h"
+#include <hip/hip_runtime.h>
 #include "pybind11/pybind11.h"
 #include "pybind11/stl.h"  // IWYU pragma: keep
 #include "pybind11_abseil/status_casters.h"  // IWYU pragma: keep
@@ -45,36 +46,37 @@
     }                                       \
   } while (false)
 
-#define CUDA_TO_STATUS(expr) \
+#define ROCM_TO_STATUS(expr) \
   jax_triton::ToStatus(expr, __FILE__, __LINE__, #expr)
 
-#define CUDA_RETURN_IF_ERROR(expr) RETURN_IF_ERROR(CUDA_TO_STATUS(expr))
+#define ROCM_RETURN_IF_ERROR(expr) RETURN_IF_ERROR(ROCM_TO_STATUS(expr))
 
 namespace py = pybind11;
 
 namespace jax_triton {
 namespace {
 
-absl::Status ToStatus(CUresult result, const char* file, int64_t line,
+absl::Status ToStatus(hipError_t result, const char* file, int64_t line,
                       const char* expr) {
-  if (ABSL_PREDICT_TRUE(result == CUDA_SUCCESS)) {
+  if (ABSL_PREDICT_TRUE(result == hipSuccess)) {
     return absl::OkStatus();
   }
 
   const char* str;
-  CHECK_EQ(cuGetErrorName(result, &str), CUDA_SUCCESS);
-  return absl::InternalError(absl::StrFormat("%s:%d: CUDA call `%s` failed: %s",
+  CHECK_EQ(hipDrvGetErrorName(result, &str), hipSuccess);
+  return absl::InternalError(absl::StrFormat("%s:%d: ROCM call `%s` failed: %s",
                                              file, line, expr, str));
 }
 
-constexpr uint32_t kNumThreadsPerWarp = 32;
+constexpr uint32_t kNumThreadsPerWarp = 64;
+// constexpr uint32_t kNumThreadsPerWarp = 32;
 
-struct CuModuleDeleter {
-  void operator()(CUmodule module) { cuModuleUnload(module); }
+struct hipModuleDeleter {
+  void operator()(hipModule_t module) { hipModuleUnload(module); }
 };
 
-using OwnedCUmodule =
-    std::unique_ptr<std::remove_pointer_t<CUmodule>, CuModuleDeleter>;
+using OwnedhipModule =
+    std::unique_ptr<std::remove_pointer_t<hipModule_t>, hipModuleDeleter>;
 
 class TritonKernel {
  public:
@@ -85,35 +87,53 @@ class TritonKernel {
         block_dim_x_(num_warps * kNumThreadsPerWarp),
         shared_mem_bytes_(shared_mem_bytes) {}
 
-  absl::Status Launch(CUstream stream, uint32_t grid[3], void** params) {
-    CUcontext context;
-    CUDA_RETURN_IF_ERROR(cuStreamGetCtx(stream, &context));
-    absl::StatusOr<CUfunction> kernel = GetFunctionForContext(context);
+  absl::Status Launch(hipStream_t stream, uint32_t grid[3], void** params) {
+    // TOD0: invetigate
+    hipCtx_t context;
+    hipDevice_t device;
+    int device_id = hipGetStreamDeviceId(stream);
+    ROCM_RETURN_IF_ERROR(hipDeviceGet(&device, device_id));
+    ROCM_RETURN_IF_ERROR(hipDevicePrimaryCtxRetain(&context, device));
+    absl::StatusOr<hipFunction_t> kernel = GetFunctionForContext(context);
     RETURN_IF_ERROR(kernel.status());
-    return CUDA_TO_STATUS(cuLaunchKernel(
+    return ROCM_TO_STATUS(hipModuleLaunchKernel(
         *kernel, grid[0], grid[1], grid[2], block_dim_x_,
         /*blockDimY=*/1, /*blockDimZ=*/1, shared_mem_bytes_, stream, params,
         /*extra=*/nullptr));
   }
 
  private:
-  absl::StatusOr<CUfunction> GetFunctionForContext(CUcontext context) {
+  absl::StatusOr<hipFunction_t> GetFunctionForContext(hipCtx_t context) {
     absl::MutexLock lock(&mutex_);
     auto it = functions_.find(context);
     if (it != functions_.end()) {
       return it->second;
     }
 
-    CUDA_RETURN_IF_ERROR(cuCtxPushCurrent(context));
-    absl::Cleanup ctx_restorer = [] { cuCtxPopCurrent(nullptr); };
+    // set HIP options
+    hipJitOption opt[] = {hipJitOptionErrorLogBufferSizeBytes,
+                          hipJitOptionErrorLogBuffer,
+                          hipJitOptionInfoLogBufferSizeBytes,
+                          hipJitOptionInfoLogBuffer, hipJitOptionLogVerbose};
+    const unsigned int errbufsize = 8192;
+    const unsigned int logbufsize = 8192;
+    char _err[errbufsize];
+    char _log[logbufsize];
+    void *optval[] = {(void *)(uintptr_t)errbufsize, (void *)_err,
+                      (void *)(uintptr_t)logbufsize, (void *)_log, (void *)1};
 
-    CUmodule module;
-    CUDA_RETURN_IF_ERROR(cuModuleLoadData(&module, module_image_.c_str()));
-    modules_.push_back(OwnedCUmodule(module, CuModuleDeleter()));
+    ROCM_RETURN_IF_ERROR(hipCtxPushCurrent(context));
+    absl::Cleanup ctx_restorer = [] { hipCtxPopCurrent(nullptr); };
 
-    CUfunction function;
-    CUDA_RETURN_IF_ERROR(
-        cuModuleGetFunction(&function, module, kernel_name_.c_str()));
+    hipModule_t module;
+    void* hsaco_data = const_cast<char*>(module_image_.c_str());
+    ROCM_RETURN_IF_ERROR(hipModuleLoadDataEx(&module, hsaco_data, 5, opt, optval));
+    // ROCM_RETURN_IF_ERROR(hipModuleLoadData(&module, hsaco_data));
+    modules_.push_back(OwnedhipModule(module, hipModuleDeleter()));
+
+    hipFunction_t function;
+    ROCM_RETURN_IF_ERROR(
+        hipModuleGetFunction(&function, module, kernel_name_.c_str()));
     auto [_, success] = functions_.insert({context, function});
     CHECK(success);
 
@@ -125,27 +145,27 @@ class TritonKernel {
     }
 
     // Set up dynamic shared memory.
-    CUdevice device;
-    CUDA_RETURN_IF_ERROR(cuCtxGetDevice(&device));
+    hipDevice_t device;
+    ROCM_RETURN_IF_ERROR(hipCtxGetDevice(&device));
 
     int shared_optin;
-    CUDA_RETURN_IF_ERROR(cuDeviceGetAttribute(
-        &shared_optin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    ROCM_RETURN_IF_ERROR(hipDeviceGetAttribute(
+        &shared_optin, hipDeviceAttributeMaxSharedMemoryPerBlock ,
         device));
 
     if (shared_optin > kMaxStaticSharedMemBytes) {
-      CUDA_RETURN_IF_ERROR(
-          cuFuncSetCacheConfig(function, CU_FUNC_CACHE_PREFER_SHARED));
+      //ROCM_RETURN_IF_ERROR(
+      //    cuFuncSetCacheConfig(function, hipFuncCachePreferShared));
       int shared_total;
-      CUDA_RETURN_IF_ERROR(cuDeviceGetAttribute(
+      ROCM_RETURN_IF_ERROR(hipDeviceGetAttribute(
           &shared_total,
-          CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, device));
+          hipDeviceAttributeMaxSharedMemoryPerMultiprocessor, device));
       int shared_static;
-      CUDA_RETURN_IF_ERROR(cuFuncGetAttribute(
-          &shared_static, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function));
-      CUDA_RETURN_IF_ERROR(cuFuncSetAttribute(
-          function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-          shared_optin - shared_static));
+      ROCM_RETURN_IF_ERROR(hipFuncGetAttribute(
+          &shared_static, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function));
+      //ROCM_RETURN_IF_ERROR(cuFuncSetAttribute(
+      //    function, HIP_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+      //    shared_optin - shared_static));
     }
     return function;
   }
@@ -156,13 +176,13 @@ class TritonKernel {
   uint32_t shared_mem_bytes_;
 
   absl::Mutex mutex_;
-  std::vector<OwnedCUmodule> modules_ ABSL_GUARDED_BY(mutex_);
-  absl::flat_hash_map<CUcontext, CUfunction> functions_ ABSL_GUARDED_BY(mutex_);
+  std::vector<OwnedhipModule> modules_ ABSL_GUARDED_BY(mutex_);
+  absl::flat_hash_map<hipCtx_t, hipFunction_t> functions_ ABSL_GUARDED_BY(mutex_);
 };
 
 struct TritonKernelCallBase {
   virtual ~TritonKernelCallBase() = default;
-  virtual absl::Status Launch(CUstream stream, void** buffers) = 0;
+  virtual absl::Status Launch(hipStream_t stream, void** buffers) = 0;
 };
 
 class TritonKernelCall : public TritonKernelCallBase {
@@ -181,7 +201,7 @@ class TritonKernelCall : public TritonKernelCallBase {
         grid_{grid_0, grid_1, grid_2},
         parameters_(std::move(parameters)) {}
 
-  absl::Status Launch(CUstream stream, void** buffers) override final {
+  absl::Status Launch(hipStream_t stream, void** buffers) override final {
     std::vector<void*> params;
     params.reserve(parameters_.size());
     for (size_t i = 0; i < parameters_.size(); ++i) {
@@ -189,16 +209,16 @@ class TritonKernelCall : public TritonKernelCallBase {
       if (std::holds_alternative<ArrayParameter>(param)) {
         const ArrayParameter& array = std::get<ArrayParameter>(param);
         void*& ptr = *(buffers++);
-        auto cu_ptr = reinterpret_cast<CUdeviceptr>(ptr);
+        auto hip_ptr = reinterpret_cast<hipDeviceptr_t>(ptr);
 
-        if (array.ptr_must_be_divisible_by_16 && (cu_ptr % 16 != 0)) {
-          return absl::InvalidArgumentError(absl::StrFormat(
-              "Parameter %zu (%p) is not divisible by 16.", i, ptr));
-        }
+        //if (array.ptr_must_be_divisible_by_16 && (hip_ptr % 16 != 0)) {
+        //  return absl::InvalidArgumentError(absl::StrFormat(
+        //      "Parameter %zu (%p) is not divisible by 16.", i, ptr));
+        //}
 
         if (array.bytes_to_zero > 0) {
-          CUDA_RETURN_IF_ERROR(
-              cuMemsetD8Async(cu_ptr, 0, array.bytes_to_zero, stream));
+          ROCM_RETURN_IF_ERROR(
+              hipMemsetD8Async(hip_ptr, 0, array.bytes_to_zero, stream));
         }
         params.push_back(&ptr);
       } else {
@@ -229,7 +249,7 @@ class TritonAutotunedKernelCall : public TritonKernelCallBase {
         configs_(std::move(configs)),
         input_output_aliases_(std::move(input_output_aliases)) {}
 
-  absl::Status Launch(CUstream stream, void** buffers) override {
+  absl::Status Launch(hipStream_t stream, void** buffers) override {
     absl::call_once(autotune_once_, [=]() {
       if (configs_.size() > 1) {
         autotune_status_ = Autotune(stream, buffers);
@@ -243,12 +263,14 @@ class TritonAutotunedKernelCall : public TritonKernelCallBase {
  private:
   static constexpr float kBenchmarkTimeMillis = 10.;
 
-  absl::Status Autotune(CUstream stream, void** buffers) {
+  absl::Status Autotune(hipStream_t stream, void** buffers) {
     // Ensure a valid context for driver calls that don't take the stream.
-    CUcontext context;
-    CUDA_RETURN_IF_ERROR(cuStreamGetCtx(stream, &context));
-    CUDA_RETURN_IF_ERROR(cuCtxPushCurrent(context));
-    absl::Cleanup ctx_restorer = [] { cuCtxPopCurrent(nullptr); };
+    hipCtx_t context;
+    hipDevice_t device;
+    int device_id = hipDeviceGet(&device, device_id);
+    ROCM_RETURN_IF_ERROR(hipDevicePrimaryCtxRetain(&context, device));
+    ROCM_RETURN_IF_ERROR(hipCtxPushCurrent(context));
+    absl::Cleanup ctx_restorer = [] { hipCtxPopCurrent(nullptr); };
 
     // If an input aliases with an output, it will get overwritten during the
     // kernel execution. If the kernel is called repeatedly, as we do during
@@ -258,9 +280,9 @@ class TritonAutotunedKernelCall : public TritonKernelCallBase {
     for (auto [input_idx, output_idx, size] : input_output_aliases_) {
       if (buffers[input_idx] == buffers[output_idx]) {
         std::vector<uint8_t> input_copy(size);
-        CUDA_RETURN_IF_ERROR(cuMemcpyDtoHAsync(
+        ROCM_RETURN_IF_ERROR(hipMemcpyDtoHAsync(
             input_copy.data(),
-            reinterpret_cast<CUdeviceptr>(buffers[input_idx]), size, stream));
+            reinterpret_cast<hipDeviceptr_t>(buffers[input_idx]), size, stream));
         input_copies[input_idx] = std::move(input_copy);
       }
     }
@@ -310,32 +332,32 @@ class TritonAutotunedKernelCall : public TritonKernelCallBase {
 
     // Restore aliased inputs to their original values.
     for (auto [input_idx, _, size] : input_output_aliases_) {
-      CUDA_RETURN_IF_ERROR(
-          cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(buffers[input_idx]),
+      ROCM_RETURN_IF_ERROR(
+          hipMemcpyHtoDAsync(reinterpret_cast<hipDeviceptr_t>(buffers[input_idx]),
                             input_copies[input_idx].data(), size, stream));
     }
     // Synchronize stream to ensure copies are complete before the host copy
     // is deleted.
-    return CUDA_TO_STATUS(cuStreamSynchronize(stream));
+    return ROCM_TO_STATUS(hipStreamSynchronize(stream));
   }
 
-  absl::StatusOr<float> Benchmark(CUstream stream,
+  absl::StatusOr<float> Benchmark(hipStream_t stream,
                                   TritonKernelCall& kernel_call, void** buffers,
                                   int num_iterations) {
-    CUevent start, stop;
-    CUDA_RETURN_IF_ERROR(cuEventCreate(&start, /*Flags=*/CU_EVENT_DEFAULT));
-    CUDA_RETURN_IF_ERROR(cuEventCreate(&stop, /*Flags=*/CU_EVENT_DEFAULT));
+    hipEvent_t start, stop;
+    ROCM_RETURN_IF_ERROR(hipEventCreateWithFlags(&start, /*Flags=*/hipEventDefault));
+    ROCM_RETURN_IF_ERROR(hipEventCreateWithFlags(&stop, /*Flags=*/hipEventDefault));
     RETURN_IF_ERROR(kernel_call.Launch(stream, buffers));  // Warm-up iteration.
-    CUDA_RETURN_IF_ERROR(cuEventRecord(start, stream));
+    ROCM_RETURN_IF_ERROR(hipEventRecord(start, stream));
     for (int i = 0; i < num_iterations; ++i) {
       RETURN_IF_ERROR(kernel_call.Launch(stream, buffers));
     }
-    CUDA_RETURN_IF_ERROR(cuEventRecord(stop, stream));
-    CUDA_RETURN_IF_ERROR(cuEventSynchronize(stop));
+    ROCM_RETURN_IF_ERROR(hipEventRecord(stop, stream));
+    ROCM_RETURN_IF_ERROR(hipEventSynchronize(stop));
     float elapsed_ms;
-    CUDA_RETURN_IF_ERROR(cuEventElapsedTime(&elapsed_ms, start, stop));
-    CUDA_RETURN_IF_ERROR(cuEventDestroy(start));
-    CUDA_RETURN_IF_ERROR(cuEventDestroy(stop));
+    ROCM_RETURN_IF_ERROR(hipEventElapsedTime(&elapsed_ms, start, stop));
+    ROCM_RETURN_IF_ERROR(hipEventDestroy(start));
+    ROCM_RETURN_IF_ERROR(hipEventDestroy(stop));
     return elapsed_ms;
   }
 
@@ -408,13 +430,13 @@ absl::StatusOr<uint64_t> EncodeKernelParameter(py::bool_ value,
 
 }  // namespace
 
-void LaunchTritonKernel(CUstream stream, void** buffers, char* opaque,
+void LaunchTritonKernel(hipStream_t stream, void** buffers, char* opaque,
                         size_t opaque_len) {
-  CHECK_EQ(opaque_len, sizeof(TritonKernelCallBase*));
-  TritonKernelCallBase* kernel_call;
-  std::memcpy(&kernel_call, opaque, sizeof(TritonKernelCallBase*));
-  absl::Status status = kernel_call->Launch(stream, buffers);
-  LOG_IF(FATAL, !status.ok()) << status;  // TODO(cjfj): Return the `Status`.
+CHECK_EQ(opaque_len, sizeof(TritonKernelCallBase *));
+TritonKernelCallBase *kernel_call;
+std::memcpy(&kernel_call, opaque, sizeof(TritonKernelCallBase *));
+absl::Status status = kernel_call->Launch(stream, buffers);
+LOG_IF(FATAL, !status.ok()) << status; // TODO(cjfj): Return the `Status`.
 }
 
 PYBIND11_MODULE(triton_kernel_call_lib, m) {
@@ -481,12 +503,13 @@ PYBIND11_MODULE(triton_kernel_call_lib, m) {
         py::overload_cast<py::bool_, std::string_view>(&EncodeKernelParameter));
   m.def("get_compute_capability", [](int device) -> absl::StatusOr<int> {
     int major, minor;
-    CUDA_RETURN_IF_ERROR(cuInit(device));
-    CUDA_RETURN_IF_ERROR(cuDeviceGetAttribute(
-        &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
-    CUDA_RETURN_IF_ERROR(cuDeviceGetAttribute(
-        &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+    ROCM_RETURN_IF_ERROR(hipInit(device));
+    ROCM_RETURN_IF_ERROR(hipDeviceGetAttribute(
+        &major, hipDeviceAttributeComputeCapabilityMajor, device));
+    ROCM_RETURN_IF_ERROR(hipDeviceGetAttribute(
+        &minor, hipDeviceAttributeComputeCapabilityMinor, device));
     return major * 10 + minor;
+    //return 80;
   });
 }
 

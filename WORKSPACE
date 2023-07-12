@@ -4,19 +4,19 @@ load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 new_local_repository(
-  name = "cuda",
-  path = "/usr/local/cuda",
+  name = "rocm",
+  path = "/opt/rocm-5.5.0",
   build_file_content = """
 cc_library(
-    name = "cuda_headers",
-    hdrs = glob(["include/*.h"]),
+    name = "rocm_headers",
+    hdrs = glob(["include/**/*.h"]),
     includes = ["include/"],
     visibility = ["//visibility:public"],
 )
 
 cc_library(
-    name = "libcuda",
-    srcs = ["lib64/stubs/libcuda.so"],
+    name = "libamdhip64",
+    srcs = ["lib/libamdhip64.so"],
     visibility = ["//visibility:public"],
 )
   """

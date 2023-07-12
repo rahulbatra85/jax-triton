@@ -6,6 +6,7 @@ load("@pybind11_bazel//:build_defs.bzl", "pybind_extension")
 pybind_extension(
     name = "triton_kernel_call_lib",
     srcs = ["lib/triton_kernel_call.cc"],
+    copts = ["-D__HIP_PLATFORM_AMD__"],
     deps = [
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/base:core_headers",
@@ -17,8 +18,8 @@ pybind_extension(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
-        "@cuda//:cuda_headers",
-        "@cuda//:libcuda",
+        "@rocm//:rocm_headers",
+        "@rocm//:libamdhip64",
         "@pybind11_abseil//pybind11_abseil:status_casters",
     ],
 )

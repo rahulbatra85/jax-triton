@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jax_triton.pallas import core as pallas_core
+from ..triton_lib import write_to_file
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -87,7 +88,7 @@ def _pallas_call_impl(*args, jaxpr, name, out_shapes, which_linear,
     grid = grid_spec.grid
     discharged_jaxpr, consts = state_discharge.discharge_state(jaxpr, ())
     if debug:
-      print(discharged_jaxpr)
+      write_to_file(discharged_jaxpr, "dump.jaxpr")
     loop_indices = jnp.array(list(it.product(*(range(g) for g in grid))))
     oi_map = {v: k for k, v in input_output_aliases}
     out = []

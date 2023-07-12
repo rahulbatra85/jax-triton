@@ -49,9 +49,15 @@ from jax_triton.pallas import primitives
 from jax_triton.triton_lib import compile_ttir_inplace
 from jax_triton.triton_lib import get_triton_type
 import numpy as np
+import triton
 from triton._C.libtriton.triton import ir as tl_ir
 from triton.compiler import code_generator as code_gen
+from triton.compiler import compiler as tc
 import triton.language as tl
+import triton._C.libtriton.triton as _triton
+from pathlib import Path
+
+from ..triton_lib import write_to_file
 
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
@@ -172,7 +178,7 @@ def lower_jaxpr_to_triton_module(
   assert len(jaxpr.outvars) == 0
   prototype = tl.function_type([], arg_types)
   out = prototype.to_ir(builder)
-  fn = builder.get_or_insert_function(module, name, out, "public")
+  fn = builder.get_or_insert_function(module, name, out, "public", False)
   module.push_back(fn)
   entry = fn.add_entry_block()
   args = []
@@ -1338,7 +1344,8 @@ def compile_jaxpr(
       num_stages=num_stages,
       dump=debug,
   )
-  return TritonCompilationResult(cubin, name, asm, shared_mem, lowering_result)
+
+  return TritonCompilationResult(Path(cubin[1]).read_bytes(), name, asm, shared_mem, lowering_result)
 
 
 def pallas_call_lowering(
@@ -1370,11 +1377,13 @@ def pallas_call_lowering(
         grid_spec=grid_spec,
         **compiler_params
     )
+
+  # TODO: revert to num_stages to 3
   num_warps = compiler_params.get("num_warps", 4)
-  num_stages = compiler_params.get("num_stages", 3)
+  num_stages = compiler_params.get("num_stages", 1)
+  # print(f"num_warps = {num_warps}, num_stage = {num_stages}")
   if debug:
-    print(jaxpr)
-    print(grid_spec)
+    write_to_file(str(jaxpr)+str(grid_spec), "dump.jaxpr")
   compilation_result = compile_jaxpr(
       jaxpr,
       tuple((*in_shapes, *out_shapes)),
@@ -1384,12 +1393,14 @@ def pallas_call_lowering(
       num_stages,
       debug=debug,
   )
-  cubin = compilation_result.cubin
+  hsaco = compilation_result.cubin
   name = compilation_result.name
   shared_mem = compilation_result.shared_mem
   lowering_result = compilation_result.lowering_result
+
   if debug:
-    lowering_result.module.dump()
+    # lowering_result.module.dump()
+    write_to_file(lowering_result.module, "dump.llvm.mlir")
   out_type = ir.TupleType.get_tuple(
       [
           ir.RankedTensorType.get(
@@ -1400,7 +1411,7 @@ def pallas_call_lowering(
   )
   i32_type = ir.IntegerType.get_signless(32)
   kernel = triton_kernel_call_lib.TritonKernel(
-      cubin, name, num_warps, shared_mem
+      hsaco, name, num_warps, shared_mem
   )
   grid = triton_utils.normalize_grid(
       compilation_result.lowering_result.grid, metaparams={}
@@ -1446,9 +1457,9 @@ def pallas_call_lowering(
   return results
 
 
-mlir.register_lowering(pallas_call_p, pallas_call_lowering, platform="cuda")
+mlir.register_lowering(pallas_call_p, pallas_call_lowering, platform="rocm")
 xc.register_custom_call_target(
     "triton_kernel_call",
     triton_kernel_call_lib.get_custom_call(),
-    platform="CUDA",
+    platform="ROCM",
 )

@@ -17,10 +17,13 @@ import collections
 import functools
 import math
 import os
+import shutil
 import types
 import weakref
+import re
 
 from typing import Any, Callable, Dict, Optional, Protocol, Sequence, Tuple, Union
+from pathlib import Path
 
 from absl import logging
 import jax
@@ -129,9 +132,47 @@ def aval_size_bytes(aval):
 # alive by the jitted JAX function.
 _COMPILED_KERNEL_CACHE = weakref.WeakValueDictionary()
 
-def ptx_get_kernel_name(module) -> str:
-  return tc.get_kernel_name(module, pattern='// .globl')
+def get_kernel_name(module) -> str:
+  return tc.get_kernel_name(module[0], pattern='.globl')
 
+def get_amdgpu_arch_fulldetails():
+    """
+    get the amdgpu fulll ISA details for compiling:
+    i.e., arch_triple: amdgcn-amd-amdhsa; arch_name: gfx906; arch_features: sramecc+:xnack-
+    """
+    try:
+        # TODO: package rocm.cc with Triton
+        arch_info = _triton.get_arch_info()
+        warp_size = _triton.get_warp_size()
+        gfx_arch_details = re.search('amd.*', arch_info).group(0).strip().split('--')
+        arch_triple = gfx_arch_details[0]
+        arch_name_features = gfx_arch_details[1].split(':')
+        arch_name = arch_name_features[0]
+        arch_features = ""
+
+        if (len(arch_name_features) == 3):
+            arch_features = "+" + re.search('\\w+', arch_name_features[1]).group(0) + ","\
+                            "-" + re.search('\\w+', arch_name_features[2]).group(0)
+        return [arch_triple, arch_name, arch_features, warp_size]
+    except BaseException:
+        return None
+
+def load_hsaco_file(filename) -> str:
+    f = open(filename, "r")
+    module = f.read()
+    return module
+
+def write_to_file(content: any, file_name: str, dirpath = "log"):
+  # clean and setup log file
+  if not os.path.exists(dirpath):
+    os.mkdir(dirpath)
+  file_path = os.path.join(dirpath, file_name)
+
+  # write file
+  content = str(content)
+  f = open(file_path, "a")
+  f.write(content)
+  f.close()
 
 def compile_ttir_inplace(
     ttir,
@@ -142,37 +183,45 @@ def compile_ttir_inplace(
 ) -> Tuple[bytes, str, int, Dict[str, str]]:
   """Compiles a TTIR module to CUBIN (the TTIR is modified in-place)."""
   compute_capability = triton_kernel_call_lib.get_compute_capability(device)
+  arch_full_details = get_amdgpu_arch_fulldetails()
+  gfx_arch = os.environ.get('MI_GPU_ARCH', arch_full_details[1])
   if num_stages is None:
     num_stages = 3 if compute_capability >= 75 else 2
   asm = dict(ttir=str(ttir))
   if dump:
-    print(ttir)
+    write_to_file(ttir, "dump.ttir")
   try:
-    ttir = tc.optimize_ttir(ttir, compute_capability)
-    ttgir = tc.ttir_to_ttgir(ttir, num_warps)
-    ttgir = tc.optimize_ttgir(ttgir, num_stages, compute_capability)
+    ttir = tc.optimize_ttir(ttir, gfx_arch)
+    ttgir = tc.ttir_to_ttgir(ttir, num_warps, 64)
+    ttgir = tc.optimize_ttgir(ttgir, num_stages, gfx_arch)
   except RuntimeError as e:
     ttir.dump()
     raise ValueError("TTIR->TTGIR pass failed!") from e
   asm["ttgir"] = str(ttgir)
   if dump:
-    print(ttgir)
+    write_to_file(ttgir, "dump.ttgir")
   extern_libs = {}
+  extern_libs.update(tc.get_amdgcn_bitcode_paths(arch_full_details))
   try:
-    llir = tc.ttgir_to_llir(ttgir, extern_libs, compute_capability)
+    llir = tc.ttgir_to_llir(ttgir, extern_libs, gfx_arch)
   except RuntimeError as e:
     ttgir.dump()
     raise ValueError("TTGIR->LLIR pass failed!") from e
+
+
   shared_mem = _triton.get_shared_memory_size(ttgir)
+
   if dump:
-    print(llir)
-  ptx = tc.llir_to_ptx(llir, compute_capability)
+    write_to_file(llir, "dump.llir")
+  hsa = tc.llir_to_amdgcn_and_hsaco(llir, gfx_arch,
+                                          arch_full_details[0],
+                                          arch_full_details[2])
   if dump:
-    print(ptx)
-  name = ptx_get_kernel_name(ptx)
-  cubin = tc.ptx_to_cubin(ptx, compute_capability)
-  asm.update(llir=llir, ptx=ptx)
-  return cubin, name, shared_mem, asm
+    write_to_file(hsa[0], "dump.gcn")
+    write_to_file(hsa[1], "dump.hsaco_path")
+  name = get_kernel_name(hsa)
+  asm.update(llir=llir, hsa=hsa)
+  return hsa, name, shared_mem, asm
 
 
 def get_or_create_triton_kernel(
@@ -227,7 +276,7 @@ def get_or_create_triton_kernel(
         dump=dump,
     )
     kernel = triton_kernel_call_lib.TritonKernel(
-        cubin, name, num_warps, shared_mem
+        Path(cubin[1]).read_bytes(), name, num_warps, shared_mem
     )
     _COMPILED_KERNEL_CACHE[cache_key] = kernel
 
@@ -544,7 +593,7 @@ def triton_call(
         "`triton_call` is only available when `triton` is installed."
     )
   xc.register_custom_call_target(
-      call_name, triton_kernel_call_lib.get_custom_call(), platform="CUDA"
+      call_name, triton_kernel_call_lib.get_custom_call(), platform="ROCM"
   )
   out_shape = tree_util.tree_map(
       lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape)
