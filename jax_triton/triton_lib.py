@@ -15,9 +15,12 @@
 """Module for calling Triton kernels from JAX."""
 import functools
 import os
+import shutil
 import types
 from typing import Any, Callable, Dict, Optional, Protocol, Sequence, Tuple, Union
 import zlib
+import re
+from pathlib import Path
 
 from absl import logging
 import jax
@@ -42,6 +45,8 @@ try:
   from triton.runtime import autotuner
   import triton._C.libtriton.triton as _triton
   CAN_USE_TRITON = True
+  arch_info = _triton.get_arch_info()
+  warp_size = _triton.get_warp_size()
 except ModuleNotFoundError:
   pass
 try:
@@ -142,8 +147,49 @@ def aval_size_bytes(aval):
   return np.dtype(aval.dtype).itemsize * aval.size
 
 
-def ptx_get_kernel_name(module) -> str:
-  return tc.get_kernel_name(module, pattern='// .globl')
+def get_kernel_name(module) -> str:
+  return tc.get_kernel_name(module[0], pattern='.globl')
+
+
+def get_amdgpu_arch_fulldetails():
+    """
+    get the amdgpu fulll ISA details for compiling:
+    i.e., arch_triple: amdgcn-amd-amdhsa; arch_name: gfx906; arch_features: sramecc+:xnack-
+    """
+    try:
+        # TODO: package rocm.cc with Triton
+        arch_info = _triton.get_arch_info()
+        warp_size = _triton.get_warp_size()
+        #re.search('amd.*', "'amdgcn-amd-amdhsa--gfx90a:sramecc+:xnack-")
+        gfx_arch_details = re.search('amd.*', arch_info).group(0).strip().split('--')
+        arch_triple = gfx_arch_details[0]
+        arch_name_features = gfx_arch_details[1].split(':')
+        arch_name = arch_name_features[0]
+        arch_features = ""
+
+        if (len(arch_name_features) == 3):
+            arch_features = "+" + re.search('\\w+', arch_name_features[1]).group(0) + ","\
+                            "-" + re.search('\\w+', arch_name_features[2]).group(0)
+        return [arch_triple, arch_name, arch_features, warp_size]
+    except BaseException:
+        return None
+
+def load_hsaco_file(filename) -> str:
+    f = open(filename, "r")
+    module = f.read()
+    return module
+
+def write_to_file(content: any, file_name: str, dirpath = "log"):
+  # clean and setup log file
+  if not os.path.exists(dirpath):
+    os.mkdir(dirpath)
+  file_path = os.path.join(dirpath, file_name)
+
+  # write file
+  content = str(content)
+  f = open(file_path, "a")
+  f.write(content)
+  f.close()
 
 
 def compile_ttir_to_ptx_inplace(
@@ -154,33 +200,39 @@ def compile_ttir_to_ptx_inplace(
     dump: bool = False,
 ) -> Tuple[str, str, int, int]:
   compute_capability = triton_kernel_call_lib.get_compute_capability(device)
+  arch_full_details = get_amdgpu_arch_fulldetails()
+  gfx_arch = os.environ.get('MI_GPU_ARCH', arch_full_details[1])
   if num_stages is None:
-    num_stages = 3 if compute_capability >= 75 else 2
+    num_stages = 1 if compute_capability >= 75 else 1
   if dump:
-    print(ttir)
+    write_to_file(ttir, "dump.ttir")
   try:
-    ttir = tc.optimize_ttir(ttir, compute_capability)
-    ttgir = tc.ttir_to_ttgir(ttir, num_warps)
-    ttgir = tc.optimize_ttgir(ttgir, num_stages, compute_capability)
+    ttir = tc.optimize_ttir(ttir, gfx_arch)
+    ttgir = tc.ttir_to_ttgir(ttir, num_warps, 64)
+    ttgir = tc.optimize_ttgir(ttgir, num_stages, gfx_arch)
   except RuntimeError as e:
     ttir.dump()
     raise ValueError("TTIR->TTGIR pass failed!") from e
   if dump:
-    print(ttgir)
+    write_to_file(ttgir, "dump.ttgir")
   extern_libs = {}
+  extern_libs.update(tc.get_amdgcn_bitcode_paths(arch_full_details))
   try:
-    llir = tc.ttgir_to_llir(ttgir, extern_libs, compute_capability)
+    llir = tc.ttgir_to_llir(ttgir, extern_libs, gfx_arch)
   except RuntimeError as e:
     ttgir.dump()
     raise ValueError("TTGIR->LLIR pass failed!") from e
   shared_mem_bytes = _triton.get_shared_memory_size(ttgir)
   if dump:
-    print(llir)
-  ptx = tc.llir_to_ptx(llir, compute_capability)
+    write_to_file(llir, "dump.llir")
+  hsa = tc.llir_to_amdgcn_and_hsaco(llir, gfx_arch,
+                                          arch_full_details[0],
+                                          arch_full_details[2])
   if dump:
-    print(ptx)
-  name = ptx_get_kernel_name(ptx)
-  return ptx, name, shared_mem_bytes, compute_capability
+    write_to_file(hsa[0], "dump.gcn")
+    write_to_file(hsa[1], "dump.hsaco_path")
+  name = get_kernel_name(hsa)
+  return hsa, name, shared_mem_bytes, compute_capability
 
 
 _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
@@ -230,10 +282,10 @@ def get_or_create_triton_kernel(
     device = 0
     arch = triton_kernel_call_lib.get_compute_capability(device)
     module = code_gen.ast_to_ttir(
-        fn, signature, specialization, constants, debug=dump, arch=arch
+        fn, signature, specialization, constants, debug=dump
     )
     ttir = str(module)  # `module`` is compiled in-place, so copy TTIR here.
-    ptx, kernel_name, shared_mem_bytes, compute_capability = (
+    cubin, kernel_name, shared_mem_bytes, compute_capability = (
         compile_ttir_to_ptx_inplace(
             module,
             device=device,
@@ -244,7 +296,7 @@ def get_or_create_triton_kernel(
     )
 
     kernel = triton_kernel_call_lib.TritonKernel(
-        kernel_name, num_warps, shared_mem_bytes, ptx, ttir, compute_capability
+        kernel_name, num_warps, shared_mem_bytes, Path(cubin[1]).read_bytes(), ttir, compute_capability
     )
 
     _COMPILED_KERNEL_CACHE[cache_key] = kernel
@@ -448,8 +500,8 @@ def triton_call(
     out_shape: Union[ShapeDtype, Sequence[ShapeDtype]],
     grid: GridOrLambda,
     name: str = "",
-    num_warps: int = 4,
-    num_stages: int = 2,
+    num_warps: int = 1,
+    num_stages: int = 1,
     input_output_aliases: Optional[Dict[int, int]] = None,
     zeroed_outputs: Union[
         Sequence[int], Callable[[Dict[str, Any]], Sequence[int]]
@@ -547,7 +599,6 @@ def triton_call(
   flat_args, _ = tree_util.tree_flatten(args)
   # TODO(sharadmv): check in_tree is flat (no Pytrees allowed in triton_call)
   flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
-
   array_args = []
   scalar_args = []
   for i, arg in enumerate(flat_args):
@@ -558,6 +609,9 @@ def triton_call(
     else:
       array_args.append(arg)
 
+
+  (scalar_args)
+  (array_args)
   if input_output_aliases is None:
     input_output_aliases = {}
 

@@ -1,13 +1,11 @@
 [project]
-name = "jax-triton"
+name = "jax_triton"
 dynamic = ["version"]
 description = "JAX + OpenAI Triton integration"
 readme = "README.md"
 requires-python = ">=3.9,<3.11"
 dependencies = [
   "absl-py>=1.4.0",
-  "jax @ git+https://github.com/google/jax@a0c1265bbae2c3ec644d6181f23264b4794e9eac",
-  "triton-nightly @ https://aiinfra.pkgs.visualstudio.com/2692857e-05ef-43b4-ba9c-ccf1c22c437c/_packaging/07c94329-d4c3-4ad4-9e6b-f904a60032ec/pypi/download/triton-nightly/2.1.dev20230714011643/triton_nightly-2.1.0.dev20230714011643-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
 ]
 
 [project.optional-dependencies]
@@ -32,8 +30,16 @@ tests = [
 requires = ["setuptools", "setuptools-scm", "cmake"]
 build-backend = "setuptools.build_meta"
 
-[tools.setuptools]
+[tool.setuptools]
 packages = ["jax_triton"]
+
 
 [tool.setuptools.dynamic]
 version = {attr = "jax_triton.version.__version__"}
+
+#[tool.setuptools.packages.find]
+#where = ["."]  # list of folders that contain the packages (["."] by default)
+#include = ["<package name>"]  # package names should match these glob patterns (["*"] by default)
+#exclude = []  # exclude packages matching these glob patterns (empty by default)
+#namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
+
