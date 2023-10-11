@@ -296,7 +296,7 @@ def get_or_create_triton_kernel(
     )
 
     kernel = triton_kernel_call_lib.TritonKernel(
-        kernel_name, num_warps, shared_mem_bytes, Path(cubin[1]).read_bytes(), ttir, compute_capability
+        kernel_name, num_warps, shared_mem_bytes, cubin[1], ttir, compute_capability
     )
 
     _COMPILED_KERNEL_CACHE[cache_key] = kernel
