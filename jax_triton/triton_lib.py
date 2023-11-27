@@ -19,12 +19,17 @@ from __future__ import annotations
 import copy
 import functools
 import os
+import subprocess
+import shutil
 import types
 from typing import Any, Callable, Dict, Optional, Protocol, Sequence, Tuple, Union
 import zlib
+import re
+from pathlib import Path
 
 from absl import logging
 import jax
+jax.devices()
 import jaxlib
 from jax import tree_util
 from jax._src import core
@@ -46,6 +51,8 @@ try:
   from triton.runtime import autotuner
   import triton._C.libtriton.triton as _triton
   CAN_USE_TRITON = True
+  arch_info = _triton.get_arch_info()
+  warp_size = _triton.get_warp_size()
 except ModuleNotFoundError:
   pass
 try:
@@ -146,9 +153,77 @@ def aval_size_bytes(aval):
   return np.dtype(aval.dtype).itemsize * aval.size
 
 
-def ptx_get_kernel_name(module) -> str:
-  return tc.get_kernel_name(module, pattern='// .globl')
+#def ptx_get_kernel_name(module) -> str:
+def get_kernel_name(module) -> str:
+  return tc.get_kernel_name(module[0], pattern='.globl')
 
+def gpu_matrix_core_version() -> int:
+    """ Determine matrix core type available on current GPU.
+
+        0 means no tensor cores are available
+        1 corresponds to MFMA in CDNA 1 architecture
+        2 corresponds to MFMA in CDNA 2 architecture
+        3 corresponds to MFMA in CDNA 3 architecture
+    """
+
+    arch_info = _triton.get_arch_info()
+    gfx_arch_details = re.search('amd.*', arch_info)
+    if gfx_arch_details is None:
+        return 0
+    gfx_arch_details = gfx_arch_details.group(0).strip().split('--')
+    gpu_name = gfx_arch_details[1].split(':')[0]
+    if gpu_name in ['gfx908']:
+        return 1
+    if gpu_name in ['gfx90a']:
+        return 2
+    if gpu_name in ['gfx940', 'gfx941', 'gfx942']:
+        return 3
+    return 0
+
+def get_amdgpu_arch_fulldetails():
+    """
+    get the amdgpu fulll ISA details for compiling:
+    i.e., arch_triple: amdgcn-amd-amdhsa; arch_name: gfx906; arch_features: sramecc+:xnack-
+    """
+    try:
+        # TODO: package rocm.cc with Triton
+        rocm_path_dir = os.getenv("ROCM_PATH", default="/opt/rocm")
+        rocminfo = subprocess.check_output(rocm_path_dir + '/bin/rocminfo').decode()
+        gfx_arch_details = re.search('amd.*', rocminfo).group(0).strip().split('--')
+        arch_triple = gfx_arch_details[0]
+        arch_name_features = gfx_arch_details[1].split(':')
+        arch_name = arch_name_features[0]
+        arch_features = ""
+
+        # overwrite if provided by user
+        gfx_arch = os.environ.get('MI_GPU_ARCH', arch_name)
+        if gfx_arch is None:
+            raise RuntimeError('gfx_arch is None (not specified)')
+
+        mat_core_ver = gpu_matrix_core_version()
+        capability = gpu_matrix_core_version() * 100
+
+        return {"gfx_triple": arch_triple, "gfx_arch": gfx_arch, "gfx_features": arch_features,\
+                 "capability": capability, "matrix_core_version": mat_core_ver}
+    except BaseException:
+        return None
+
+def load_hsaco_file(filename) -> str:
+    f = open(filename, "r")
+    module = f.read()
+    return module
+
+def write_to_file(content: any, file_name: str, dirpath = "log"):
+  # clean and setup log file
+  if not os.path.exists(dirpath):
+    os.mkdir(dirpath)
+  file_path = os.path.join(dirpath, file_name)
+
+  # write file
+  content = str(content)
+  f = open(file_path, "a")
+  f.write(content)
+  f.close()
 
 def compile_ttir_to_ptx_inplace(
     ttir,
@@ -163,52 +238,62 @@ def compile_ttir_to_ptx_inplace(
     dump: bool = False,
 ) -> Tuple[str, str, int, int]:
   compute_capability = triton_kernel_call_lib.get_compute_capability(device)
+  arch_full_details = get_amdgpu_arch_fulldetails()
+  gfx_arch = os.environ.get('MI_GPU_ARCH', arch_full_details["gfx_arch"])
   if num_warps is None:
     num_warps = tc.get_arch_default_num_warps(device_type)
+    #num_warps = 1
   if num_stages is None:
     num_stages = tc.get_arch_default_num_stages(
         device_type, capability=compute_capability
     )
+    #num_stages = 1
   if dump:
+    write_to_file(ttir, "dump.ttir")
     print(ttir)
   try:
-    target = tc.CudaTargetDescriptor(
-        capability=compute_capability,
-        num_warps=num_warps,
-        enable_fp_fusion=enable_fp_fusion,
-    )
-    ttir = tc.optimize_ttir(ttir, target)
-    ttgir = tc.ttir_to_ttgir(ttir, num_warps, num_ctas=num_ctas, target=target)
+    ttir = tc.optimize_ttir(ttir, arch_full_details)
+    ttgir = tc.ttir_to_ttgir(ttir, num_warps, warpsize=64, num_ctas=num_ctas, target=arch_full_details)
     ttgir = tc.optimize_ttgir(
         ttgir,
         num_stages,
         num_warps,
         num_ctas=num_ctas,
-        target=target,
+        target=arch_full_details,
         cluster_info=_triton.ClusterInfo(),
         enable_warp_specialization=enable_warp_specialization,
         enable_persistent=enable_persistent,
         optimize_epilogue=False,
+        matrix_inst_type=0
     )
   except RuntimeError as e:
     ttir.dump()
     raise ValueError("TTIR->TTGIR pass failed!") from e
   if dump:
+    write_to_file(ttgir, "dump.ttgir")
     print(ttgir)
+
   extern_libs = {}
+  extern_libs.update(tc.get_amdgcn_bitcode_paths(gfx_arch))
+  #print(extern_libs)
+
   try:
-    llir = tc.ttgir_to_llir(ttgir, extern_libs, target, _triton.TMAInfos())
+    llir = tc.ttgir_to_llir(ttgir, extern_libs, target=arch_full_details, tma_infos=_triton.TMAInfos())
   except RuntimeError as e:
     ttgir.dump()
     raise ValueError("TTGIR->LLIR pass failed!") from e
   shared_mem_bytes = _triton.get_shared_memory_size(ttgir)
   if dump:
     print(llir)
-  ptx = tc.llir_to_ptx(llir, target)
+  
+  hsa = _triton.translate_llvmir_to_hsaco(llir, gfx_arch, arch_full_details['gfx_triple'], arch_full_details['gfx_features'])
+
+  #print(f"HSA: {type(hsa)} hsa={hsa[1]}")
   if dump:
-    print(ptx)
-  name = ptx_get_kernel_name(ptx)
-  return ptx, name, shared_mem_bytes, compute_capability
+    write_to_file(hsa[0], "dump.gcn")
+    write_to_file(hsa[1], "dump.hsaco_path")
+  name = get_kernel_name(hsa)
+  return hsa[1], name, shared_mem_bytes, compute_capability
 
 
 _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
@@ -231,6 +316,7 @@ def get_or_create_triton_kernel(
   device_type = "cuda"
   if num_warps is None:
     num_warps = tc.get_arch_default_num_warps(device_type)
+    #num_warps = 1
 
   signature = dict(enumerate(arg_dtypes))
   # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
@@ -273,7 +359,7 @@ def get_or_create_triton_kernel(
         fn, signature, specialization, constants, debug=dump, target=arch
     )
     ttir = str(module)  # `module`` is compiled in-place, so copy TTIR here.
-    ptx, kernel_name, shared_mem_bytes, compute_capability = (
+    cubin, kernel_name, shared_mem_bytes, compute_capability = (
         compile_ttir_to_ptx_inplace(
             module,
             device=device,
@@ -289,7 +375,8 @@ def get_or_create_triton_kernel(
     )
 
     kernel = triton_kernel_call_lib.TritonKernel(
-        kernel_name, num_warps, shared_mem_bytes, ptx, ttir, compute_capability
+        kernel_name, num_warps, shared_mem_bytes, 
+        cubin[1], ttir, compute_capability
     )
 
     _COMPILED_KERNEL_CACHE[cache_key] = kernel
@@ -516,8 +603,8 @@ def triton_call(
     grid: GridOrLambda,
     name: str = "",
     custom_call_target_name: str = "triton_kernel_call",
-    num_warps: Optional[int] = None,
-    num_stages: Optional[int] = None,
+    num_warps: Optional[int] = 1,
+    num_stages: Optional[int] = 1,
     num_ctas: int = 1,
     enable_fp_fusion: bool = True,
     enable_warp_specialization: bool = False,
