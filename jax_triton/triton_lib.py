@@ -48,7 +48,10 @@ try:
   from triton.runtime import autotuner
   import triton._C.libtriton as _triton
   from triton._C.libtriton import ir as tl_ir
-  import triton.backends.nvidia.compiler as cb
+  #import triton.backends.nvidia.compiler as cb
+  import triton.backends.amd.compiler as bc
+  import triton.backends.amd.driver as bd
+  
 
   CAN_USE_TRITON = True
 except ModuleNotFoundError:
@@ -155,18 +158,21 @@ def aval_size_bytes(aval):
 
 def compile_ttir_to_ptx_inplace(
     ttir,
-    cuda_backend: cb.CUDABackend,
-    cuda_options: cb.CUDAOptions,
+    #cuda_backend: cb.CUDABackend,
+    #cuda_options: cb.CUDAOptions,
+    backend: bc.HIPBackend,
+    options: bc.HIPOptions,
     device: int = 0,
-    device_type: str = "cuda",
+    #device_type: str = "cuda",
+    device_type: str = "rocm",
 ) -> Tuple[str, str, int, int]:
   compute_capability = triton_kernel_call_lib.get_compute_capability(device)
-  if cuda_options.debug:
+  if options.debug:
     print(ttir)
   if isinstance(ttir, ir.Module):
     context = _triton.ir.context()
     _triton.ir.load_dialects(context)
-    cuda_backend.load_dialects(context)
+    backend.load_dialects(context)
 
     # Triton compilation APIs only accept Triton-specific MLIR wrappers.
     # So, here we serialize an ir.Module to a file and then deserialize
@@ -178,42 +184,58 @@ def compile_ttir_to_ptx_inplace(
     ttir.context = context
   try:
     metadata = dict()
-    opt_ttir = cuda_backend.make_ttir(ttir, metadata, cuda_options)
-    ttgir = cuda_backend.make_ttgir(
+    opt_ttir = backend.make_ttir(ttir, metadata, options)
+    ttgir = backend.make_ttgir(
         opt_ttir,
         metadata,
-        cuda_options,
-        compute_capability,
+        options,
+        #compute_capability,
     )
   except RuntimeError as e:
     ttir.dump()
     raise ValueError("TTIR->TTGIR pass failed!") from e
-  if cuda_options.debug:
+  if options.debug:
     print(ttgir)
   try:
-    llir = cuda_backend.make_llir(
+    llir = backend.make_llir(
         ttgir,
         metadata,
-        cuda_options,
+        options,
         compute_capability,
     )
   except RuntimeError as e:
     ttgir.dump()
     raise ValueError("TTGIR->LLIR pass failed!") from e
   shared_mem_bytes = metadata["shared"]
-  if cuda_options.debug:
+  if options.debug:
     print(llir)
-  ptx = cuda_backend.make_ptx(
+  #ptx = cuda_backend.make_ptx(
+  hsaco = backend.make_hsaco(
       llir,
       metadata,
-      cuda_options,
-      compute_capability,
+      options,
+      #compute_capability,
   )
-  if cuda_options.debug:
-    print(ptx)
+  if options.debug:
+    print(hsaco)
   name = metadata["name"]
-  cluster_dims = metadata["cluster_dims"]
-  return ptx, name, shared_mem_bytes, compute_capability, cluster_dims
+  #cluster_dims = metadata["cluster_dims"]
+  cluster_dims = (1,1,1)
+  #print(f"RB name={name}") 
+  #print(f"RB hsaco={hsaco}") 
+  #print(f"RB hsaco[0]={hsaco[0]}") 
+  #print(f"RB hsaco[1]={hsaco[1]}")
+  fd, hsaco_path = tempfile.mkstemp() 
+  with os.fdopen(fd, "wb") as f:
+    f.write(hsaco)
+  #print(f"RB: hsaco_path={hsaco_path}")  
+  #with open(hsaco_path,"rb") as f:
+  #  data = f.read()
+  #  print(f"RB hsaco read back={data}")
+  #hsaco = hsaco[0].decode('unicode_escape')
+  #print(f"RB hsaco={hsaco}")
+  #print(f"RB type(hsaco)={type(hsaco)}")
+  return hsaco_path, name, shared_mem_bytes, compute_capability, cluster_dims
 
 
 _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
@@ -231,7 +253,8 @@ def get_or_create_triton_kernel(
     metaparams,
     dump: bool,
 ) -> Tuple[triton_kernel_call_lib.TritonKernel, Any]:
-  device_type = "cuda"
+  #device_type = "cuda"
+  device_type = "rocm"
   if num_warps is None:
     num_warps = 4
   # TODO(sharadmv): handle multiple devices, right now we assume device 0
@@ -240,7 +263,7 @@ def get_or_create_triton_kernel(
   device = 0
   arch = triton_kernel_call_lib.get_compute_capability(device)
   if num_stages is None:
-    num_stages = 3
+    num_stages = 1
 
   signature = dict(enumerate(arg_dtypes))
   # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
@@ -273,10 +296,12 @@ def get_or_create_triton_kernel(
 
   if kernel is None:
 
-    target = ("cuda", arch)
-    cuda_backend = cb.CUDABackend(target)
-
-    cuda_options = cuda_backend.parse_options(
+    #target = ("cuda", arch)
+    #cuda_backend = cb.CUDABackend(target)
+    print(f"RB: arch={arch}, target={tc.driver.active.get_current_target()}")
+    target = tc.driver.active.get_current_target()
+    backend = bc.HIPBackend(target)
+    options = backend.parse_options(
         dict(
             num_warps=num_warps,
             num_stages=num_stages,
@@ -286,10 +311,10 @@ def get_or_create_triton_kernel(
             enable_fp_fusion=enable_fp_fusion,
         )
     )
-
+    
     context = _triton.ir.context()
     _triton.ir.load_dialects(context)
-    cuda_backend.load_dialects(context)
+    backend.load_dialects(context)
 
     module = code_gen.ast_to_ttir(
         fn,
@@ -299,26 +324,27 @@ def get_or_create_triton_kernel(
             signature=signature,
             attrs=specialization_attr,
         ),
-        options=cuda_options,
+        options=options,
         context=context,
     )
 
     ttir = str(module)  # `module`` is compiled in-place, so copy TTIR here.
-    ptx, kernel_name, shared_mem_bytes, compute_capability, cluster_dims = (
+    hsaco, kernel_name, shared_mem_bytes, compute_capability, cluster_dims = (
         compile_ttir_to_ptx_inplace(
             module,
-            cuda_backend,
-            cuda_options,
+            backend,
+            options,
             device=device,
             device_type=device_type,
         )
     )
 
+    
     kernel = triton_kernel_call_lib.TritonKernel(
         kernel_name,
         num_warps,
         shared_mem_bytes,
-        ptx,
+        hsaco,
         ttir,
         compute_capability,
         *cluster_dims,
@@ -326,6 +352,7 @@ def get_or_create_triton_kernel(
 
     _COMPILED_KERNEL_CACHE[cache_key] = kernel
 
+  #os.remove(hsaco)
   return kernel, specialization_attr
 
 
